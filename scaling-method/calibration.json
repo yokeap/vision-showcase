@@ -1,0 +1,18 @@
+{
+    "calibration_date": "2025-12-21T21:44:20.443158",
+    "image_path": "bg-scale.png",
+    "image_width": 1200,
+    "image_height": 800,
+    "point1": {
+        "x": 304,
+        "y": 481
+    },
+    "point2": {
+        "x": 769,
+        "y": 488
+    },
+    "known_distance_mm": 50.0,
+    "pixel_distance": 465.0526851873882,
+    "pixels_per_mm": 9.301053703747764,
+    "mm_per_pixel": 0.10751470014596952
+}
