@@ -38,6 +38,10 @@ class RealtimeMeasurement:
         self.pixels_per_mm = self.calibration['pixels_per_mm']
         self.mm_per_pixel = self.calibration['mm_per_pixel']
         
+        # Ground truth for error calculation (T-nut actual dimensions)
+        self.GROUND_TRUTH_WIDTH = 15.7   # mm
+        self.GROUND_TRUTH_HEIGHT = 15.8  # mm
+        
         # Detection parameters (adjustable)
         self.lower_blue = np.array([90, 50, 50])
         self.upper_blue = np.array([130, 255, 255])
@@ -51,9 +55,15 @@ class RealtimeMeasurement:
         
         # Measurement stabilization (moving average filter)
         self.filter_size = 5  # Number of frames to average (adjustable 1-20)
-        self.width_buffer = []
-        self.height_buffer = []
-        self.angle_buffer = []
+        
+        # Multi-object tracking - dictionary of buffers per object ID
+        self.object_trackers = {}  # {object_id: {'width': [], 'height': [], 'angle': [], 'last_seen': frame_num}}
+        self.frame_count = 0
+        self.max_missing_frames = 10  # Remove tracker if object missing for this many frames
+        
+        # Camera info (will be set when camera is initialized)
+        self.camera_model = ""
+        self.camera_serial = ""
         
         print("=" * 70)
         print("  REAL-TIME MEASUREMENT SYSTEM")
@@ -62,6 +72,7 @@ class RealtimeMeasurement:
         print(f"\nCalibration: {self.pixels_per_mm:.4f} pixels/mm")
         print(f"Camera: Basler a2A1920-51gcBAS")
         print(f"Stabilization: {self.filter_size}-frame moving average")
+        print(f"Ground Truth: Width={self.GROUND_TRUTH_WIDTH}mm, Height={self.GROUND_TRUTH_HEIGHT}mm")
         print("=" * 70)
     
     def load_calibration(self, path: str) -> dict:
@@ -79,7 +90,7 @@ class RealtimeMeasurement:
         Setup Basler GigE camera with optimal settings.
         
         Returns:
-            Camera object ready for capture
+            Camera object ready for capture, model name, serial number
         """
         print("\n🎥 Initializing Basler camera...")
         
@@ -96,9 +107,13 @@ class RealtimeMeasurement:
         camera = pylon.InstantCamera(tlFactory.CreateDevice(devices[0]))
         camera.Open()
         
+        # Get camera info
+        camera_model = camera.GetDeviceInfo().GetModelName()
+        camera_serial = camera.GetDeviceInfo().GetSerialNumber()
+        
         # Print camera info
-        print(f"   Model: {camera.GetDeviceInfo().GetModelName()}")
-        print(f"   Serial: {camera.GetDeviceInfo().GetSerialNumber()}")
+        print(f"   Model: {camera_model}")
+        print(f"   Serial: {camera_serial}")
         
         # Configure camera settings
         camera.PixelFormat.SetValue("RGB8")
@@ -114,6 +129,10 @@ class RealtimeMeasurement:
         # camera.ExposureTime.SetValue(10000)  # microseconds
         
         print("✓ Camera configured and ready!")
+        
+        # Store camera info in class
+        self.camera_model = camera_model
+        self.camera_serial = camera_serial
         
         return camera
     
@@ -180,6 +199,10 @@ class RealtimeMeasurement:
         width_mm = w_rot * self.mm_per_pixel
         height_mm = h_rot * self.mm_per_pixel
         
+        # Calculate errors against ground truth
+        width_error = abs(width_mm - self.GROUND_TRUTH_WIDTH)
+        height_error = abs(height_mm - self.GROUND_TRUTH_HEIGHT)
+        
         # Calculate center (use rotated rect center)
         center_x = int(cx)
         center_y = int(cy)
@@ -193,6 +216,8 @@ class RealtimeMeasurement:
             'rotated_box': box,           # 4 corner points of rotated rectangle
             'width_mm': width_mm,         # True width (longer side)
             'height_mm': height_mm,       # True height (shorter side)
+            'width_error': width_error,   # Absolute error vs ground truth
+            'height_error': height_error, # Absolute error vs ground truth
             'width_px': w_rot,
             'height_px': h_rot,
             'center': (center_x, center_y),
@@ -202,46 +227,151 @@ class RealtimeMeasurement:
         
         return measurement
     
-    def stabilize_measurement(self, measurement: dict) -> dict:
+    def assign_object_ids(self, measurements: list) -> list:
         """
-        Stabilize measurements using moving average filter.
+        Assign persistent IDs to objects based on position tracking.
+        Simple nearest-neighbor matching between frames.
         
         Args:
-            measurement: Raw measurement dict
+            measurements: List of measurement dicts
             
         Returns:
-            Stabilized measurement dict
+            List of measurements with persistent IDs assigned
+        """
+        if not measurements:
+            return []
+        
+        # Get current object centers
+        current_centers = [(m['center'][0], m['center'][1]) for m in measurements]
+        
+        # Match with existing trackers
+        used_ids = set()
+        assigned_measurements = []
+        
+        for m_idx, measurement in enumerate(measurements):
+            cx, cy = measurement['center']
+            
+            # Find closest existing tracker
+            best_id = None
+            best_dist = float('inf')
+            
+            for obj_id, tracker in self.object_trackers.items():
+                if obj_id in used_ids:
+                    continue
+                
+                # Get last known position
+                if 'last_center' in tracker:
+                    last_cx, last_cy = tracker['last_center']
+                    dist = np.sqrt((cx - last_cx)**2 + (cy - last_cy)**2)
+                    
+                    # If within reasonable distance (e.g., 100 pixels), consider it same object
+                    if dist < 100 and dist < best_dist:
+                        best_dist = dist
+                        best_id = obj_id
+            
+            # Assign ID
+            if best_id is not None:
+                measurement['id'] = best_id
+                used_ids.add(best_id)
+            else:
+                # Create new ID
+                new_id = max(self.object_trackers.keys()) + 1 if self.object_trackers else 1
+                measurement['id'] = new_id
+                used_ids.add(new_id)
+            
+            assigned_measurements.append(measurement)
+        
+        return assigned_measurements
+    
+    def stabilize_measurements(self, measurements: list) -> list:
+        """
+        Stabilize measurements for multiple objects using per-object filters.
+        
+        Args:
+            measurements: List of raw measurement dicts with IDs
+            
+        Returns:
+            List of stabilized measurement dicts
+        """
+        self.frame_count += 1
+        
+        if not measurements:
+            # Clean up old trackers (objects that haven't been seen recently)
+            to_remove = []
+            for obj_id, tracker in self.object_trackers.items():
+                if self.frame_count - tracker['last_seen'] > self.max_missing_frames:
+                    to_remove.append(obj_id)
+            
+            for obj_id in to_remove:
+                del self.object_trackers[obj_id]
+            
+            return []
+        
+        stabilized_measurements = []
+        
+        for measurement in measurements:
+            obj_id = measurement['id']
+            
+            # Create tracker if doesn't exist
+            if obj_id not in self.object_trackers:
+                self.object_trackers[obj_id] = {
+                    'width': [],
+                    'height': [],
+                    'angle': [],
+                    'width_error': [],
+                    'height_error': [],
+                    'last_seen': self.frame_count,
+                    'last_center': measurement['center']
+                }
+            
+            tracker = self.object_trackers[obj_id]
+            
+            # Update tracker
+            tracker['width'].append(measurement['width_mm'])
+            tracker['height'].append(measurement['height_mm'])
+            tracker['angle'].append(measurement['angle'])
+            tracker['width_error'].append(measurement['width_error'])
+            tracker['height_error'].append(measurement['height_error'])
+            tracker['last_seen'] = self.frame_count
+            tracker['last_center'] = measurement['center']
+            
+            # Keep buffer size limited
+            if len(tracker['width']) > self.filter_size:
+                tracker['width'].pop(0)
+                tracker['height'].pop(0)
+                tracker['angle'].pop(0)
+                tracker['width_error'].pop(0)
+                tracker['height_error'].pop(0)
+            
+            # Calculate moving average
+            stabilized = measurement.copy()
+            stabilized['width_mm'] = np.mean(tracker['width'])
+            stabilized['height_mm'] = np.mean(tracker['height'])
+            stabilized['angle'] = np.mean(tracker['angle'])
+            stabilized['width_error'] = np.mean(tracker['width_error'])
+            stabilized['height_error'] = np.mean(tracker['height_error'])
+            
+            # Store raw values for comparison
+            stabilized['width_mm_raw'] = measurement['width_mm']
+            stabilized['height_mm_raw'] = measurement['height_mm']
+            stabilized['angle_raw'] = measurement['angle']
+            stabilized['width_error_raw'] = measurement['width_error']
+            stabilized['height_error_raw'] = measurement['height_error']
+            
+            stabilized_measurements.append(stabilized)
+        
+        return stabilized_measurements
+    
+    def stabilize_measurement(self, measurement: dict) -> dict:
+        """
+        Legacy single-object stabilization (kept for compatibility).
+        Now just wraps the multi-object version.
         """
         if measurement is None:
-            # Clear buffers if no object detected
-            self.width_buffer.clear()
-            self.height_buffer.clear()
-            self.angle_buffer.clear()
             return None
         
-        # Add current measurements to buffers
-        self.width_buffer.append(measurement['width_mm'])
-        self.height_buffer.append(measurement['height_mm'])
-        self.angle_buffer.append(measurement['angle'])
-        
-        # Keep buffer size limited
-        if len(self.width_buffer) > self.filter_size:
-            self.width_buffer.pop(0)
-            self.height_buffer.pop(0)
-            self.angle_buffer.pop(0)
-        
-        # Calculate moving average
-        stabilized = measurement.copy()
-        stabilized['width_mm'] = np.mean(self.width_buffer)
-        stabilized['height_mm'] = np.mean(self.height_buffer)
-        stabilized['angle'] = np.mean(self.angle_buffer)
-        
-        # Also store raw values for comparison
-        stabilized['width_mm_raw'] = measurement['width_mm']
-        stabilized['height_mm_raw'] = measurement['height_mm']
-        stabilized['angle_raw'] = measurement['angle']
-        
-        return stabilized
+        results = self.stabilize_measurements([measurement])
+        return results[0] if results else None
     
     def draw_overlay(self, image: np.ndarray, measurement: dict = None) -> np.ndarray:
         """
@@ -418,21 +548,27 @@ class RealtimeMeasurement:
         overlay = image.copy()
         h, w = overlay.shape[:2]
         
-        # Draw status bar at top
-        cv2.rectangle(overlay, (0, 0), (w, 80), (0, 0, 0), -1)
+        # Draw status bar at top (taller for camera info)
+        cv2.rectangle(overlay, (0, 0), (w, 100), (0, 0, 0), -1)
         
         font = cv2.FONT_HERSHEY_SIMPLEX
         
-        # Title
-        cv2.putText(overlay, "REAL-TIME MEASUREMENT - MULTI OBJECT", (10, 30),
-                   font, 0.8, (0, 255, 0), 2)
+        # Title - emphasize scaling method
+        cv2.putText(overlay, "SCALING-BASED MEASUREMENT", (10, 28),
+                   font, 0.8, (0, 255, 255), 2)
+        
+        # Camera info - emphasize GigE Industrial
+        camera_text = f"Camera: {self.camera_model} (GigE Industrial)"
+        cv2.putText(overlay, camera_text, (10, 55),
+                   font, 0.55, (100, 255, 100), 1)
         
         # Object count and status
         obj_count = len(measurements) if measurements else 0
-        status_text = f"{obj_count} object(s)" + (" - FROZEN" if self.freeze_frame else " - LIVE")
-        status_color = (0, 165, 255) if self.freeze_frame else (0, 255, 0)
-        cv2.putText(overlay, status_text, (10, 60),
-                   font, 0.6, status_color, 2)
+        filter_mode = "RAW" if self.show_raw else f"FILTERED ({self.filter_size}x)"
+        status_text = f"Objects: {obj_count}  |  Mode: {filter_mode}"
+        status_color = (0, 165, 255) if self.freeze_frame else (200, 200, 200)
+        cv2.putText(overlay, status_text, (10, 80),
+                   font, 0.5, status_color, 1)
         
         # Define colors for different objects
         colors = [
@@ -490,8 +626,8 @@ class RealtimeMeasurement:
         # Measurement table on left side
         if measurements:
             table_x = 10
-            table_y = 100
-            table_width = 400
+            table_y = 110
+            table_width = 510
             row_height = 30
             table_height = min(len(measurements) * row_height + 60, h - 250)
             
@@ -509,13 +645,17 @@ class RealtimeMeasurement:
             header_y = table_y + 50
             cv2.putText(overlay, "ID", (table_x + 10, header_y),
                        font, 0.4, (200, 200, 200), 1)
-            cv2.putText(overlay, "Width(mm)", (table_x + 50, header_y),
+            cv2.putText(overlay, "Width(mm)", (table_x + 40, header_y),
                        font, 0.4, (200, 200, 200), 1)
-            cv2.putText(overlay, "Height(mm)", (table_x + 150, header_y),
+            cv2.putText(overlay, "Err (%)", (table_x + 125, header_y),
+                       font, 0.4, (255, 165, 0), 1)  # Orange for error
+            cv2.putText(overlay, "Height(mm)", (table_x + 180, header_y),
                        font, 0.4, (200, 200, 200), 1)
-            cv2.putText(overlay, "Angle", (table_x + 260, header_y),
+            cv2.putText(overlay, "Err (%)", (table_x + 260, header_y),
+                       font, 0.4, (255, 165, 0), 1)  # Orange for error
+            cv2.putText(overlay, "Angle", (table_x + 315, header_y),
                        font, 0.4, (200, 200, 200), 1)
-            cv2.putText(overlay, "Area", (table_x + 330, header_y),
+            cv2.putText(overlay, "Area", (table_x + 365, header_y),
                        font, 0.4, (200, 200, 200), 1)
             
             # Draw separator line
@@ -534,22 +674,30 @@ class RealtimeMeasurement:
                     w_val = measurement['width_mm_raw']
                     h_val = measurement['height_mm_raw']
                     a_val = measurement['angle_raw']
+                    w_err = measurement.get('width_error_raw', 0)
+                    h_err = measurement.get('height_error_raw', 0)
                 else:
                     w_val = measurement['width_mm']
                     h_val = measurement['height_mm']
                     a_val = measurement['angle']
+                    w_err = measurement.get('width_error', 0)
+                    h_err = measurement.get('height_error', 0)
                 
                 area_val = measurement['area_mm2']
                 
                 cv2.putText(overlay, f"{obj_id}", (table_x + 15, row_y),
                            font, 0.45, color, 1)
-                cv2.putText(overlay, f"{w_val:6.2f}", (table_x + 60, row_y),
+                cv2.putText(overlay, f"{w_val:6.2f}", (table_x + 45, row_y),
                            font, 0.45, (255, 255, 255), 1)
-                cv2.putText(overlay, f"{h_val:6.2f}", (table_x + 160, row_y),
+                cv2.putText(overlay, f"{w_err:.2f}", (table_x + 125, row_y),
+                           font, 0.45, (0, 165, 255), 1)  # Orange for width error
+                cv2.putText(overlay, f"{h_val:6.2f}", (table_x + 175, row_y),
                            font, 0.45, (255, 255, 255), 1)
-                cv2.putText(overlay, f"{a_val:5.1f}", (table_x + 265, row_y),
+                cv2.putText(overlay, f"{h_err:.2f}", (table_x + 260, row_y),
+                           font, 0.45, (0, 165, 255), 1)  # Orange for height error
+                cv2.putText(overlay, f"{a_val:5.1f}", (table_x + 310, row_y),
                            font, 0.45, (255, 255, 255), 1)
-                cv2.putText(overlay, f"{area_val:4.0f}", (table_x + 330, row_y),
+                cv2.putText(overlay, f"{area_val:4.0f}", (table_x + 370, row_y),
                            font, 0.45, (255, 255, 255), 1)
             
             # If more than 8 objects, show indicator
@@ -566,7 +714,7 @@ class RealtimeMeasurement:
                    (10, help_y + 25), font, 0.5, (200, 200, 200), 1)
         cv2.putText(overlay, f"Scale: {self.pixels_per_mm:.2f} px/mm  |  Filter: {self.filter_size} frames  |  Objects: {obj_count}", 
                    (10, help_y + 50), font, 0.5, (200, 200, 200), 1)
-        cv2.putText(overlay, "Multi-object detection enabled (max 10 objects)", 
+        cv2.putText(overlay, f"Ground Truth: W={self.GROUND_TRUTH_WIDTH}mm H={self.GROUND_TRUTH_HEIGHT}mm  |  Error shown in orange", 
                    (10, help_y + 75), font, 0.4, (150, 150, 150), 1)
         
         return overlay
@@ -618,27 +766,23 @@ class RealtimeMeasurement:
                     # Detect object
                     contours, mask = self.detect_object_hsv(img)
                     
-                    # Measure ALL objects found (not just the largest)
+                    # Measure ALL objects found
                     measurements = []
                     if len(contours) > 0:
-                        # Limit to reasonable number of objects (e.g., 10)
+                        # Limit to reasonable number of objects
                         max_objects = 10
                         for i, contour in enumerate(contours[:max_objects]):
                             raw_measurement = self.measure_object(contour)
-                            # Add object ID
-                            raw_measurement['id'] = i + 1
                             measurements.append(raw_measurement)
                         
-                        # Apply stabilization filter to each object
-                        # For simplicity, only filter the first object for now
-                        # (you can expand this to track multiple objects)
-                        if len(measurements) > 0:
-                            stabilized = self.stabilize_measurement(measurements[0])
-                            if stabilized:
-                                measurements[0] = stabilized
+                        # Assign persistent IDs based on position tracking
+                        measurements = self.assign_object_ids(measurements)
+                        
+                        # Apply stabilization filter to ALL objects
+                        measurements = self.stabilize_measurements(measurements)
                     else:
-                        # Clear filter buffers if no object
-                        self.stabilize_measurement(None)
+                        # No objects - clean up old trackers
+                        self.stabilize_measurements([])
                     
                     # Draw overlay
                     display = self.draw_overlay_multi(img, measurements)

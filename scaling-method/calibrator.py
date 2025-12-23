@@ -184,7 +184,7 @@ def main():
     """Main calibration workflow."""
     
     # Configuration
-    IMAGE_PATH = "bg-scale.png"  # Change this to your calibration image path
+    IMAGE_PATH = "scale-tilt.png"  # Change this to your calibration image path
     OUTPUT_JSON = "calibration.json"
     
     print("\n" + "=" * 70)

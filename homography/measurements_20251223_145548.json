@@ -1,0 +1,27 @@
+{
+    "timestamp": "2025-12-23T14:55:48.553739",
+    "num_objects": 3,
+    "measurements": [
+        {
+            "object_id": 1,
+            "width_mm": 15.651244710948857,
+            "height_mm": 16.47790393744891,
+            "area_mm2": 246.9140545085587,
+            "pass": true
+        },
+        {
+            "object_id": 2,
+            "width_mm": 15.881571895891044,
+            "height_mm": 16.424285366906705,
+            "area_mm2": 252.07901727867466,
+            "pass": true
+        },
+        {
+            "object_id": 3,
+            "width_mm": 15.768108237315511,
+            "height_mm": 16.33119831383419,
+            "area_mm2": 249.31510958500576,
+            "pass": true
+        }
+    ]
+}
